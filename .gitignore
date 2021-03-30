@@ -1,0 +1,9 @@
+# Dataset
+celeba_hq/
+
+# IDE Stuff
+.vscode/
+.__pycache__/
+
+# Tensorborad Stuff
+logs/
