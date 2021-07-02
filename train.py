@@ -1,175 +1,159 @@
-import torch
-import torch.optim as optim
-from torch.utils import tensorboard
-import torchvision.datasets as datasets
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-from utils import (
-    gradient_penalty,
-    plot_to_tensorboard,
-    save_checkpoint,
-    load_checkpoint,
-    generate_examples,
-)
-from model import Discriminator, Generator
-from math import log2
+from utils import generate_examples, generate_noise, plot_to_tensorboard
 from tqdm import tqdm
-from config import *
-
-torch.backends.cudnn.benchmarks = True
-
-
-def get_loader(image_size):
-    transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                [0.5 for _ in range(CHANNELS_IMG)],
-                [0.5 for _ in range(CHANNELS_IMG)],
-            ),
-        ]
-    )
-    batch_size = BATCH_SIZES[int(log2(image_size / 4))]
-    dataset = datasets.ImageFolder(root=DATASET, transform=transform)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-    )
-    return loader, dataset
+from dataset import FFHQ
+from math import log2
+import torch.cuda.amp
+import torch.nn as nn
+import torch.optim as optim
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from torch.utils.tensorboard import SummaryWriter
+from models import Generator, Critic
+from config import (BATCH_SIZES, DEVICE, FIXED_NOISE, IMG_CHANNELS,
+                    IN_CHANNELS, LAMBDA_GP, LRN_RATE, ADAM_BETAS, LOAD_MODEL,
+                    NUM_WORKER, PIN_MEMORY, PROGRESSIVE_EPOCHS, SAVE_MODEL,
+                    START_TRAINING_AT_IMG_SIZE, Z_DIM)
+from losses import WLossGP_Critic, WLoss_Generator
 
 
-def train_fn(critic,
-             gen,
-             loader,
-             dataset,
-             step,
-             alpha,
-             opt_critic,
-             opt_gen,
-             tensorboard_step,
-             writer,
-             scaler_gen,
-             scaler_critic):
-    loop = tqdm(loader, leave=True)
+class TrainModel(nn.Module):
+    def __init__(self, gen, critic, device):
+        super(TrainModel, self).__init__()
+        self.device = device
 
-    for batch_idx, (real, _) in enumerate(loop):
-        real = real.to(DEVICE)
-        cur_batch_size = real.shape[0]
+        self.gen = gen.to(device)
+        self.critic = critic.to(device)
 
-        # Train Critic: max E[critic(real)] - E[critic(fake)]
-        noise = torch.randn(cur_batch_size, Z_DIM, 1, 1).to(DEVICE)
+        self.gen_opt = optim.Adam(gen.parameters(),
+                                  lr=LRN_RATE,
+                                  betas=ADAM_BETAS)
+        self.critic_opt = optim.Adam(critic.parameters(),
+                                     lr=LRN_RATE,
+                                     betas=ADAM_BETAS)
 
-        with torch.cuda.amp.autocast():
-            fake = gen(noise, alpha, step)
-            critic_real = critic(real, alpha, step)
+        self.critic_loss_fn = WLossGP_Critic(self.critic, LAMBDA_GP)
+        self.gen_loss_fn = WLoss_Generator()
 
-            critic_fake = critic(fake.detach(), alpha, step)
-            gp = gradient_penalty(critic, real, fake,
-                                  alpha, step, device=DEVICE)
+        self.scaler_critic = torch.cuda.amp.GradScaler()
+        self.scaler_gen = torch.cuda.amp.GradScaler()
 
-            loss_critic = (
-                -(torch.mean(critic_real) - torch.mean(critic_fake))
-                + LAMBDA_GP * gp
-                + (0.001 * torch.mean(critic_real ** 2))
-            )
+        self.writer = SummaryWriter("logs/gan1")
+        self.tensorboard_step = 0
 
-        opt_critic.zero_grad()
-        scaler_critic.scale(loss_critic.to(DEVICE)).backward()
-        scaler_critic.step(opt_critic)
-        scaler_critic.update()
+        if LOAD_MODEL:
+            self.__load_checkpoint__()
 
-        # Train Generator: max E(critic(gen_fake))
+        self.gen.init_weights()
+        self.critic.init_weights()
 
-        with torch.cuda.amp.autocast():
-            gen_fake = critic(fake, alpha, step)
-            loss_gen = - torch.mean(gen_fake)
+        self.gen.train()
+        self.critic.train()
 
-        opt_gen.zero_graph()
-        scaler_gen.scale(loss_gen).backward()
-        scaler_gen.step(opt_gen)
-        scaler_gen.update()
+    def __train_one__(self, alpha, loader, step, len_dataset):
+        loop = tqdm(loader, leave=True)
 
-        alpha += cur_batch_size / \
-            (len(dataset) * PROGRESSIVE_EPOCHS[step] * 0.5)
-        alpha = min(alpha, 1)
+        for batch_idx, real in enumerate(loop):
+            cur_batch_size = real.shape[0]
+            real = real.to(self.device)
 
-        if batch_idx % 500 == 0:
-            with torch.no_grad():
-                fixed_fakes = gen(FIXED_NOISE, alpha, step) * 0.5 + 0.5
+            noise = generate_noise(Z_DIM, cur_batch_size).to(self.device)
 
-            plot_to_tensorboard(
-                writer,
-                loss_critic.item(),
-                loss_gen.item(),
-                real.detach(),
-                fixed_fakes.detach(),
-                tensorboard_step
-            )
+            # with torch.cuda.amp.autocast():
+            fake = self.gen(noise, alpha, step)
+            # print(fake)
+            # exit()
+            pred_r = self.critic(real, alpha, step)
+            pred_f = self.critic(fake.detach(), alpha, step)
 
-            tensorboard_step += 1
+            loss_c = self.critic_loss_fn(prediction_real=pred_r,
+                                         prediction_fake=pred_f,
+                                         real=real,
+                                         fake=fake,
+                                         α=alpha,
+                                         train_step=step)
+
+            self.critic_opt.zero_grad()
+            self.scaler_critic.scale(loss_c).backward(retain_graph=True)
+            self.scaler_critic.step(self.critic_opt)
+            self.scaler_critic.update()
+
+            # with torch.cuda.amp.autocast():
+            gen_fake = self.critic(fake, alpha, step)
+            loss_g = self.gen_loss_fn(gen_fake)
+
+            self.gen_opt.zero_grad()
+            self.scaler_gen.scale(loss_g).backward()
+            self.scaler_gen.step(self.gen_opt)
+            self.scaler_gen.update()
+
+            alpha += cur_batch_size / (len_dataset * PROGRESSIVE_EPOCHS[step] *
+                                       0.5)
+            alpha = min(alpha, 1)
+
+            if batch_idx % 5 == 0:
+                with torch.no_grad():
+                    fixed_fakes = self.gen(FIXED_NOISE, alpha,
+                                           step) * 0.5 + 0.5
+                    plot_to_tensorboard(self.writer, loss_c.item(),
+                                        loss_g.item(), real.detach(),
+                                        fixed_fakes.detach(),
+                                        self.tensorboard_step)
+                    self.tensorboard_step += 1
+
+            loop.set_postfix(loss_critic=loss_c.item(), loss_gen=loss_g.item())
+
+        return alpha
+
+    def forward(self, alpha, loader, num_epochs, step, len_dataset):
+        for epoch in range(num_epochs):
+            print(f"Epoch [{epoch + 1} / {num_epochs}]")
+            alpha = self.__train_one__(alpha, loader, step, len_dataset)
+            generate_examples(self.gen, step)
+
+        if SAVE_MODEL:
+            self.__save_checkpoint__()
+
+        step += 1
+
+    def __load_checkpoint__(self):
+        print("=>> Loading Checkpoint")
+        self.gen.load(self.gen_opt)
+        self.critic.load(self.critic_opt)
+
+    def __save_checkpoint__(self):
+        print("=>> Saving Checkpoint")
+        self.gen.save(self.gen_opt)
+        self.critic.save(self.critic_opt)
 
 
 def main():
-    gen = Generator(Z_DIM, IN_CHANNELS, CHANNELS_IMG).to(DEVICE)
-    critic = Discriminator(IN_CHANNELS, CHANNELS_IMG).to(DEVICE)
+    gen = Generator(Z_DIM, IN_CHANNELS, IMG_CHANNELS)
+    critic = Critic(IN_CHANNELS, IMG_CHANNELS)
 
-    opt_gen = optim.Adam(gen.parameters(), lr=LEARNING_RATE, betas=(0.0, 0.99))
-    opt_critic = optim.Adam(
-        critic.parameters(), lr=LEARNING_RATE, betas=(0.0, 0.99)
-    )
+    transforms = A.Compose([
+        A.transforms.HorizontalFlip(p=0.5),
+        A.transforms.Normalize(mean=(0.5205, 0.4254, 0.3804),
+                               std=(0.2825, 0.2567, 0.2575)),
+        ToTensorV2()
+    ])
 
-    scaler_critic = torch.cuda.amp.GradScaler()
-    scaler_gen = torch.cuda.amp.GradScaler()
+    trainObj = TrainModel(gen, critic, DEVICE)
 
-    writer = SummaryWriter(f"logs/gan")
+    step = int(log2(START_TRAINING_AT_IMG_SIZE / 4))
 
-    if LOAD_MODEL:
-        load_checkpoint(
-            CHECKPOINT_GEN, gen, opt_gen, LEARNING_RATE
-        )
-        load_checkpoint(
-            CHECKPOINT_CRITIC, critic, opt_critic, LEARNING_RATE
-        )
-
-    gen.train()
-    critic.train()
-
-    tensorboard_step = 0
-    step = int(log2(START_TRAIN_AT_IMG_SIZE / 4))
-
-    for num_epochs in PROGRESSIVE_EPOCHS[step:]:
+    for num_epoch in PROGRESSIVE_EPOCHS[step:]:
         alpha = 1e-5
-        loader, dataset = get_loader(4 * 2 ** step)
-        print(f"Image Size: {4 * 2 ** step}")
+        img_size = 4 * 2**step
+        dataset = FFHQ('data/archive/*.png',
+                       size=(img_size, img_size),
+                       transforms=transforms)
 
-        for epoch in range(num_epochs):
-            print(f"Epoch [{epoch+1}/{num_epochs}]")
-            tensorboard_step, alpha = train_fn(
-                critic,
-                gen,
-                loader,
-                dataset,
-                step,
-                alpha,
-                opt_critic,
-                opt_gen,
-                tensorboard_step,
-                writer,
-                scaler_gen,
-                scaler_critic
-            )
+        loader = dataset.dataloader(batch_size=BATCH_SIZES[step],
+                                    num_workers=NUM_WORKER,
+                                    pin_memory=PIN_MEMORY)
 
-            if SAVE_MODEL:
-                save_checkpoint(gen, opt_gen, filename=CHECKPOINT_GEN)
-                save_checkpoint(critic, opt_critic, filename=CHECKPOINT_CRITIC)
-
-        step += 1
+        print(f"Image Size: {img_size}")
+        trainObj(alpha, loader, num_epoch, step, len(dataset))
 
 
 if __name__ == "__main__":

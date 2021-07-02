@@ -7,3 +7,6 @@ celeba_hq/
 
 # Tensorborad Stuff
 logs/
+
+# mypy cache
+.mypy_cache/
